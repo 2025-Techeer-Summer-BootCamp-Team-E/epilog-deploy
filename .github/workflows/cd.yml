@@ -1,0 +1,254 @@
+name: TeamE CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "배포 환경"
+        required: true
+        default: "production"
+        type: choice
+        options:
+          - staging
+          - production
+
+jobs:
+  deploy:
+    name: 🚀 서비스 배포
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'production' }}
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 📢 배포 시작 알림
+        uses: 8398a7/action-slack@v3
+        with:
+          status: custom
+          custom_payload: |
+            {
+              text: "🚀 TeamE 배포 시작",
+              attachments: [{
+                color: "warning",
+                fields: [{
+                  title: "환경",
+                  value: "${{ github.event.inputs.environment || 'production' }}",
+                  short: true
+                }, {
+                  title: "브랜치",
+                  value: "${{ github.ref_name }}",
+                  short: true
+                }, {
+                  title: "커밋",
+                  value: "<${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}|${{ github.sha }}>",
+                  short: true
+                }, {
+                  title: "실행자",
+                  value: "${{ github.actor }}",
+                  short: true
+                }]
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: 🔍 배포 전 검증
+        run: |
+          echo "🔍 배포 파일 검증 중..."
+          if [ ! -f "docker-compose.yml" ]; then
+            echo "❌ docker-compose.yml 파일이 없습니다!"
+            exit 1
+          fi
+          echo "✅ docker-compose.yml 파일 확인됨"
+
+          # docker-compose 파일 유효성 검사
+          if ! grep -q "services:" docker-compose.yml; then
+            echo "❌ docker-compose.yml 파일이 유효하지 않습니다!"
+            exit 1
+          fi
+          echo "✅ docker-compose.yml 파일 유효성 검사 완료"
+
+      - name: 📤 배포 파일 서버 전송
+        id: copy
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          source: "docker-compose.yml"
+          target: /home/${{ secrets.SSH_USERNAME }}/epilog-deploy/
+          strip_components: 0
+
+      - name: 🎯 서버 배포 실행
+        id: deploy
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          command_timeout: 30m
+          script: |
+            echo "🚀 배포 프로세스 시작..."
+            cd /home/${{ secrets.SSH_USERNAME }}/epilog-deploy
+
+            # 현재 실행 중인 서비스 상태 백업
+            echo "💾 현재 서비스 상태 백업 중..."
+            mkdir -p backups
+            docker compose ps > backups/services_backup_$(date +%Y%m%d_%H%M%S).txt || echo "서비스 상태 백업 생략"
+
+            # 기존 컨테이너 중지
+            echo "🛑 기존 서비스 중지 중..."
+            docker compose down --remove-orphans
+
+            # 최신 이미지 다운로드
+            echo "📥 최신 이미지 다운로드 중..."
+            docker compose pull
+
+            # 새 서비스 시작
+            echo "🚀 새 서비스 시작 중..."
+            docker compose up -d
+
+            # 서비스 시작 대기
+            echo "⏳ 서비스 시작 대기 중..."
+            sleep 30
+
+            # 헬스체크
+            echo "🩺 서비스 헬스체크 중..."
+            max_attempts=20
+            attempt=1
+
+            while [ $attempt -le $max_attempts ]; do
+              if docker compose ps | grep -q "Up"; then
+                echo "✅ 서비스가 정상적으로 실행 중입니다. (시도: $attempt/$max_attempts)"
+                
+                # 추가 헬스체크 (포트 확인)
+                if command -v curl >/dev/null 2>&1; then
+                  if curl -f -s http://localhost/health >/dev/null 2>&1 || curl -f -s http://localhost >/dev/null 2>&1; then
+                    echo "✅ HTTP 헬스체크도 성공했습니다."
+                  else
+                    echo "⚠️ HTTP 헬스체크는 실패했지만 컨테이너는 실행 중입니다."
+                  fi
+                fi
+                break
+              fi
+              
+              echo "⏳ 헬스체크 대기 중... (시도: $attempt/$max_attempts)"
+              sleep 15
+              ((attempt++))
+              
+              if [ $attempt -gt $max_attempts ]; then
+                echo "❌ 헬스체크 최종 실패"
+                echo "🔍 서비스 상태 확인:"
+                docker compose ps
+                echo "📋 로그 확인:"
+                docker compose logs --tail=50
+                exit 1
+              fi
+            done
+
+            # 사용하지 않는 이미지 정리
+            echo "🧹 사용하지 않는 이미지 정리 중..."
+            docker image prune -f || echo "이미지 정리 생략"
+
+            echo "🎉 배포 성공!"
+            echo "📊 최종 서비스 상태:"
+            docker compose ps
+
+      - name: 🔄 롤백 (배포 실패 시)
+        if: failure() && steps.deploy.conclusion == 'failure'
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          script: |
+            echo "🔄 롤백 프로세스 시작..."
+            cd /home/${{ secrets.SSH_USERNAME }}/epilog-deploy
+
+            # 현재 서비스 중지
+            docker compose down --remove-orphans
+
+            # 이전 백업 찾기
+            latest_backup=$(ls -t backups/services_backup_*.txt 2>/dev/null | head -1)
+            if [ -n "$latest_backup" ]; then
+              echo "📋 이전 백업 발견: $latest_backup"
+            fi
+
+            # Git을 사용한 롤백 (이전 커밋으로)
+            if [ -d ".git" ]; then
+              echo "📦 Git 기반 롤백 시도 중..."
+              git reset --hard HEAD~1 || echo "Git 롤백 실패"
+            fi
+
+            # 서비스 재시작
+            echo "🚀 이전 버전으로 서비스 재시작 중..."
+            docker compose up -d
+
+            # 롤백 후 헬스체크
+            sleep 20
+            if docker compose ps | grep -q "Up"; then
+              echo "✅ 롤백 성공"
+            else
+              echo "❌ 롤백도 실패"
+              docker compose logs --tail=30
+            fi
+
+      - name: 📢 배포 완료 알림
+        if: always()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          custom_payload: |
+            {
+              text: "${{ job.status == 'success' && '✅ TeamE 배포 성공!' || '❌ TeamE 배포 실패!' }}",
+              attachments: [{
+                color: "${{ job.status == 'success' && 'good' || 'danger' }}",
+                fields: [{
+                  title: "환경",
+                  value: "${{ github.event.inputs.environment || 'production' }}",
+                  short: true
+                }, {
+                  title: "브랜치",
+                  value: "${{ github.ref_name }}",
+                  short: true
+                }, {
+                  title: "커밋",
+                  value: "<${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}|${{ github.sha }}>",
+                  short: true
+                }, {
+                  title: "소요 시간",
+                  value: "${{ job.status == 'success' && '성공' || '실패' }}",
+                  short: true
+                }, {
+                  title: "Action 링크",
+                  value: "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|워크플로우 보기>",
+                  short: false
+                }]
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: 🧹 배포 파일 정리 (선택사항)
+        if: success()
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          script: |
+            echo "🧹 배포 파일 정리 중..."
+            cd /home/${{ secrets.SSH_USERNAME }}/epilog-deploy
+
+            # 오래된 백업 파일 정리 (30일 이상)
+            find backups/ -name "*.txt" -type f -mtime +30 -delete 2>/dev/null || echo "정리할 백업 파일 없음"
+
+            echo "✅ 정리 완료"
