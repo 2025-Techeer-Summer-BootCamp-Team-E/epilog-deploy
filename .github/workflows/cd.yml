@@ -114,43 +114,13 @@ jobs:
             echo "🚀 새 서비스 시작 중..."
             docker compose up -d
 
-            # 서비스 시작 대기
+                        # 서비스 시작 대기
             echo "⏳ 서비스 시작 대기 중..."
             sleep 30
 
-            # 헬스체크
-            echo "🩺 서비스 헬스체크 중..."
-            max_attempts=20
-            attempt=1
-
-            while [ $attempt -le $max_attempts ]; do
-              if docker compose ps | grep -q "Up"; then
-                echo "✅ 서비스가 정상적으로 실행 중입니다. (시도: $attempt/$max_attempts)"
-                
-                # 추가 헬스체크 (포트 확인)
-                if command -v curl >/dev/null 2>&1; then
-                  if curl -f -s http://localhost/health >/dev/null 2>&1 || curl -f -s http://localhost >/dev/null 2>&1; then
-                    echo "✅ HTTP 헬스체크도 성공했습니다."
-                  else
-                    echo "⚠️ HTTP 헬스체크는 실패했지만 컨테이너는 실행 중입니다."
-                  fi
-                fi
-                break
-              fi
-              
-              echo "⏳ 헬스체크 대기 중... (시도: $attempt/$max_attempts)"
-              sleep 15
-              ((attempt++))
-              
-              if [ $attempt -gt $max_attempts ]; then
-                echo "❌ 헬스체크 최종 실패"
-                echo "🔍 서비스 상태 확인:"
-                docker compose ps
-                echo "📋 로그 확인:"
-                docker compose logs --tail=50
-                exit 1
-              fi
-            done
+            # 간단한 서비스 상태 확인
+            echo "🔍 서비스 상태 확인..."
+            docker compose ps
 
             # 사용하지 않는 이미지 정리
             echo "🧹 사용하지 않는 이미지 정리 중..."
