@@ -33,6 +33,7 @@ services:
   # Django 애플리케이션 서비스 설정
   backend-django:
     image: ghcr.io/teame/backend-django:1.1.68
+
     container_name: backend-django
     command: python -m gunicorn config.wsgi:application --bind 0.0.0.0:8000
     volumes:
